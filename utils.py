@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from torchvision import transforms as T
 from skimage.metrics import peak_signal_noise_ratio
 from skimage.metrics import structural_similarity
+import torchvision
 
 from color_space import *
 
@@ -79,15 +80,26 @@ def compare(img1,img2):
     img1_np = np.transpose(img1_np, (1, 2, 0))
     img2_np = np.transpose(img2_np, (1, 2, 0))
 
-    ssim = structural_similarity(img1_np,img2_np,multichannel=True)
+    
+    #img1_np = np.nan_to_num(img1_np, nan=0.0)
+    #img2_np = np.nan_to_num(img2_np, nan=0.0)
+
+    print(f'img1 shape :{img1_np.shape}, img2 shape : {img2_np.shape}')
+    #print(f'img1 nan replace후:{np.min(img1_np)},{np.max(img2_np)}')
+    #ssim = structural_similarity(img1_np,img2_np,multichannel=True)
+    ssim = structural_similarity(img1_np,img2_np,channel_axis=2,data_range=1.0)
+    
     psnr = peak_signal_noise_ratio(img1_np,img2_np)
 
     return ssim, psnr
 
-def lab_attack(X_nat, c_trg, model, epsilon=0.05, iter = 100):
+def lab_attack(X_nat, c_trg, model, epsilon=0.01, iter = 100):
 
     criterion = nn.MSELoss().cuda()
-    pert_a = torch.zeros(X_nat.shape[0], 2, X_nat.shape[2], X_nat.shape[3]).cuda().requires_grad_()
+    #pert_a = torch.zeros(X_nat.shape[0], 2, X_nat.shape[2], X_nat.shape[3]).cuda().requires_grad_()
+    print(f'X_nat shape :{X_nat.shape}')
+    pert_a = (torch.ones(X_nat.shape[0], 2, X_nat.shape[2], X_nat.shape[3]) * 0.01).cuda().requires_grad_()
+
 
     optimizer = torch.optim.Adam([pert_a], lr=1e-4, betas=(0.9, 0.999))
 
@@ -97,9 +109,15 @@ def lab_attack(X_nat, c_trg, model, epsilon=0.05, iter = 100):
 
     for i in range(iter):
         X_lab = rgb2lab(X).cuda()
+       
         pert = torch.clamp(pert_a, min=-epsilon, max=epsilon)
+        print(f'pert requires grad?:{pert.requires_grad}')
+
         X_lab[:, 1:, :, :] = X_lab[:, 1:, :, :] + pert
+        
+        
         X_new = T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])(lab2rgb(X_lab))
+        
 
         #X_new = random_transform(X_new)
 
@@ -108,7 +126,9 @@ def lab_attack(X_nat, c_trg, model, epsilon=0.05, iter = 100):
 
         gen_stargan, gen_feats_stargan = model(X_new, c_trg[i%5])
 
+        print(f"result requires grad: {gen_stargan.requires_grad},{gen_noattack.requires_grad}")
         loss = -criterion(gen_stargan, gen_noattack)
+        print(f'loss:{loss.item()}')
 
         optimizer.zero_grad()
         loss.backward()
@@ -116,4 +136,56 @@ def lab_attack(X_nat, c_trg, model, epsilon=0.05, iter = 100):
 
     return X_new, X_new - X
 
+def lab_attack_faceswap(X_src, X_tgt, model, epsilon=0.07, iter=100):
+    """
+    Faceswapping 적대적 공격 함수
+    - X_src: 소스 이미지 (Face Swapping에 사용할 기준 얼굴)
+    - X_tgt: 타겟 이미지 (Face Swapping 대상 얼굴)
+    - model: Face Swapping 모델
+    - epsilon: perturbation 크기 제한
+    - iter: 공격 반복 횟수
+    """
+    # 손실 함수 및 초기화
+    criterion = nn.MSELoss().cuda()
+    #pert_a = torch.zeros(X_tgt.shape[0], 2, X_tgt.shape[2], X_tgt.shape[3]).cuda().requires_grad_(True)
+    pert_a = (torch.ones(X_tgt.shape[0], 2, X_tgt.shape[2], X_tgt.shape[3]) * 0.01).cuda().requires_grad_()
+
+    optimizer = torch.optim.Adam([pert_a], lr=1e-2, betas=(0.9, 0.999))
+    X_tgt_denorm = denorm(X_tgt.clone())
+
+    # Latent ID 생성
+    X_src_downsample = F.interpolate(X_src, size=(112, 112))  # Arcface 입력 크기에 맞게 downsample
+    latend_id = model.netArc(X_src_downsample)
+    latend_id = latend_id.detach().to('cpu')
+    latend_id = latend_id / np.linalg.norm(latend_id, axis=1, keepdims=True)
+    #latend_id = latend_id / torch.norm(latend_id, dim=1, keepdim=True)
+    latend_id = latend_id.to('cuda')
+
+  
+    for i in range(iter):
+        # LAB 색상 공간으로 변환 및 공격 적용
+        X_lab = rgb2lab(X_tgt_denorm).cuda()
+        
+        pert = torch.clamp(pert_a, min=-epsilon, max=epsilon)
+        print(f'pert requires grad : {pert.requires_grad}')
+        X_lab[:, 1:, :, :] = X_lab[:, 1:, :, :] + pert
+        X_tgt_adv = T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])(lab2rgb(X_lab))
+        
+        with torch.no_grad():
+            img_fake_noattack = model(X_src, X_tgt, latend_id, latend_id, True)
+        img_fake_attack = model(X_src, X_tgt_adv, latend_id, latend_id, True)
+
+        print(f'pert a grad_fn{pert.grad_fn}')
+
+        # 손실 계산
+        loss = -criterion(img_fake_attack, img_fake_noattack)
+        
+        print(f'iter {i} loss a : {loss.item()}')
+
+        # Gradient Update
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    return X_tgt_adv, X_tgt_adv - X_tgt
 
