@@ -6,8 +6,12 @@ from torchvision import transforms as T
 from skimage.metrics import peak_signal_noise_ratio
 from skimage.metrics import structural_similarity
 import torchvision
+from torchvision.utils import save_image
+import os
+import cv2
 
 from color_space import *
+from torchvision.models import vgg16
 
 def load_model_weights(model, path):
     pretrained_dict = torch.load(path, map_location=lambda storage, loc: storage)
@@ -136,7 +140,9 @@ def lab_attack(X_nat, c_trg, model, epsilon=0.01, iter = 100):
 
     return X_new, X_new - X
 
-def lab_attack_faceswap(X_src, X_tgt, model, epsilon=0.07, iter=100):
+
+
+def lab_attack_faceswap(X_src, X_tgt, model, epsilon=0.07, iter=100, output_dir='./output'):
     """
     Faceswapping 적대적 공격 함수
     - X_src: 소스 이미지 (Face Swapping에 사용할 기준 얼굴)
@@ -145,6 +151,8 @@ def lab_attack_faceswap(X_src, X_tgt, model, epsilon=0.07, iter=100):
     - epsilon: perturbation 크기 제한
     - iter: 공격 반복 횟수
     """
+
+    os.makedirs(output_dir,exist_ok=True)
     # 손실 함수 및 초기화
     criterion = nn.MSELoss().cuda()
     #pert_a = torch.zeros(X_tgt.shape[0], 2, X_tgt.shape[2], X_tgt.shape[3]).cuda().requires_grad_(True)
@@ -161,8 +169,9 @@ def lab_attack_faceswap(X_src, X_tgt, model, epsilon=0.07, iter=100):
     #latend_id = latend_id / torch.norm(latend_id, dim=1, keepdim=True)
     latend_id = latend_id.to('cuda')
 
+    X_tgt_adv_list=[]
   
-    for i in range(iter):
+    for i in range(1,iter+1):
         # LAB 색상 공간으로 변환 및 공격 적용
         X_lab = rgb2lab(X_tgt_denorm).cuda()
         
@@ -170,6 +179,7 @@ def lab_attack_faceswap(X_src, X_tgt, model, epsilon=0.07, iter=100):
         print(f'pert requires grad : {pert.requires_grad}')
         X_lab[:, 1:, :, :] = X_lab[:, 1:, :, :] + pert
         X_tgt_adv = T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])(lab2rgb(X_lab))
+        
         
         with torch.no_grad():
             img_fake_noattack = model(X_src, X_tgt, latend_id, latend_id, True)
@@ -187,5 +197,85 @@ def lab_attack_faceswap(X_src, X_tgt, model, epsilon=0.07, iter=100):
         loss.backward()
         optimizer.step()
 
+        
+        # 10,20,..,100 번째 iteration에서 저장
+        if i== iter:
+            # perturbation 이미지 저장
+            
+            #pert_np = pert[0].detach().cpu().numpy()  # 첫 번째 배치만 저장
+            #pert_img = (pert_np - pert_np.min()) / (pert_np.max() - pert_np.min()) * 255  # 정규화
+            #pert_img = pert_img.transpose(1, 2, 0).astype(np.uint8)  # (C, H, W) -> (H, W, C)
+
+            # RGB로 저장하기 위해 BGR 변환
+            #if pert_img.shape[2] == 2:  # 채널이 2개일 경우, 빈 채널 추가
+            #    pert_img = cv2.merge([pert_img[:, :, 0], pert_img[:, :, 1], np.zeros_like(pert_img[:, :, 0])])
+            #cv2.imwrite(os.path.join(output_dir, f"perturbation_iter_{i+1}_tr2.jpg"), pert_img)
+            
+
+
+            # 적대적 입력 이미지 저장
+           
+            X_tgt_adv_np = X_tgt_adv[0].detach().permute(1, 2, 0).cpu().numpy()  # (C, H, W) -> (H, W, C)
+            X_tgt_adv_np = (X_tgt_adv_np - X_tgt_adv_np.min()) / (X_tgt_adv_np.max() - X_tgt_adv_np.min()) * 255  # 정규화
+            X_tgt_adv_np = X_tgt_adv_np.astype(np.uint8)
+            cv2.imwrite(os.path.join(output_dir, f"adversarial_input_iter_{i}_e0.07.jpg"), cv2.cvtColor(X_tgt_adv_np, cv2.COLOR_RGB2BGR))
+            
+            # 모델 출력 이미지 저장
+            
+            #img_fake_attack_np = img_fake_attack[0].detach().permute(1, 2, 0).cpu().numpy()  # (C, H, W) -> (H, W, C)
+            #img_fake_attack_np = (img_fake_attack_np - img_fake_attack_np.min()) / (img_fake_attack_np.max() - img_fake_attack_np.min()) * 255  # 정규화
+            #img_fake_attack_np = img_fake_attack_np.astype(np.uint8)
+            #cv2.imwrite(os.path.join(output_dir, f"output_iter_{i}_tr2.jpg"), cv2.cvtColor(img_fake_attack_np, cv2.COLOR_RGB2BGR))
+        
     return X_tgt_adv, X_tgt_adv - X_tgt
+
+def lab_attack_faceswap_video(X_src, X_tgt_batch, model, epsilon=0.07, iter=100, output_dir='./output'):
+    """
+    Adversarial attack for video frames.
+    - X_src: Source image (Face Swapping baseline identity).
+    - X_tgt_batch: Batch of target frames.
+    - model: Face Swapping model.
+    - epsilon: Perturbation magnitude.
+    - iter: Number of attack iterations.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    criterion = nn.MSELoss().cuda()
+    pert_a = (torch.ones(X_tgt_batch.shape[0], 2, X_tgt_batch.shape[2], X_tgt_batch.shape[3]) * 0.01).cuda().requires_grad_()
+    optimizer = torch.optim.Adam([pert_a], lr=1e-2, betas=(0.9, 0.999))
+    X_tgt_batch_denorm = denorm(X_tgt_batch.clone())
+
+    # Generate latent ID
+    X_src_downsample = F.interpolate(X_src, size=(112, 112))
+    latend_id = model.netArc(X_src_downsample)
+    latend_id = F.normalize(latend_id, p=2, dim=1).cuda()
+
+    for i in range(1, iter + 1):
+        X_lab = rgb2lab(X_tgt_batch_denorm).cuda()
+        pert = torch.clamp(pert_a, min=-epsilon, max=epsilon)
+        X_lab[:, 1:, :, :] += pert
+        X_tgt_adv_batch = T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])(lab2rgb(X_lab))
+
+        with torch.no_grad():
+            img_fake_noattack = model(X_src, X_tgt_batch, latend_id, latend_id, True)
+        img_fake_attack = model(X_src, X_tgt_adv_batch, latend_id, latend_id, True)
+
+        loss = -criterion(img_fake_attack, img_fake_noattack)
+        optimizer.zero_grad()
+        loss.backward(retain_graph=True)
+        optimizer.step()
+
+        """
+        # Save adversarial frames every 10 iterations
+        if i % 10 == 0:
+            for frame_idx, X_tgt_adv in enumerate(X_tgt_adv_batch):
+                frame_adv_np = X_tgt_adv.detach().permute(1, 2, 0).cpu().numpy()
+                frame_adv_np = (frame_adv_np - frame_adv_np.min()) / (frame_adv_np.max() - frame_adv_np.min()) * 255
+                frame_adv_np = frame_adv_np.astype(np.uint8)
+                cv2.imwrite(os.path.join(output_dir, f"adversarial_frame_{frame_idx}_iter_{i}.jpg"),
+                            cv2.cvtColor(frame_adv_np, cv2.COLOR_RGB2BGR))
+        """
+
+    return X_tgt_adv_batch
+
+
 
